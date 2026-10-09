@@ -1,0 +1,219 @@
+import json
+import logging
+import os
+import random
+from datetime import time
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+BASE_DIR = Path(__file__).resolve().parent
+QURAN_FILE = BASE_DIR / "quran.json"
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TIMEZONE_NAME = os.getenv("TIMEZONE", "Africa/Addis_Ababa").strip()
+DAILY_HOUR = int(os.getenv("DAILY_HOUR", "8"))
+DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "0"))
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+
+def load_quran() -> list[dict]:
+    """Read the nested combined Quran JSON and flatten it into individual verses."""
+    if not QURAN_FILE.exists():
+        raise RuntimeError(f"quran.json not found at: {QURAN_FILE}")
+    if QURAN_FILE.stat().st_size == 0:
+        raise RuntimeError("quran.json is empty.")
+
+    try:
+        with QURAN_FILE.open("r", encoding="utf-8-sig") as file:
+            data = json.load(file)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
+
+    if not isinstance(data, dict) or not isinstance(data.get("surahs"), list):
+        raise RuntimeError("Invalid Quran JSON: expected a top-level 'surahs' list.")
+
+    verses = []
+    for surah in data["surahs"]:
+        try:
+            surah_number = int(surah["number"])
+            surah_name = str(surah.get("name_english") or f"Surah {surah_number}")
+            surah_verses = surah["verses"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid surah entry in quran.json: {exc}") from exc
+
+        if not isinstance(surah_verses, list):
+            raise RuntimeError(f"Invalid verses list for surah {surah_number}.")
+
+        for verse in surah_verses:
+            try:
+                verses.append({
+                    "surah": surah_name,
+                    "surah_number": surah_number,
+                    "ayah_number": int(verse["ayah"]),
+                    "arabic": str(verse["arabic"]),
+                    "english": str(verse["english"]),
+                })
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Invalid verse in surah {surah_number}: {exc}"
+                ) from exc
+
+    if len(verses) != 6236:
+        raise RuntimeError(
+            f"Expected 6236 verses, but loaded {len(verses)}. "
+            "Check that quran.json is the complete dataset."
+        )
+
+    logger.info("Successfully loaded %s Quran verses.", len(verses))
+    return verses
+
+
+VERSES = load_quran()
+
+
+def format_verse(verse: dict) -> str:
+    return (
+        f"📖 {verse['surah']} — Surah {verse['surah_number']}, "
+        f"Ayah {verse['ayah_number']}\n\n"
+        f"{verse['arabic']}\n\n"
+        f"{verse['english']}"
+    )
+
+
+async def remember_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remember chats that start the bot so scheduled messages can reach them."""
+    if not update.effective_chat:
+        return
+    subscribers: set[int] = context.application.bot_data.setdefault("subscribers", set())
+    subscribers.add(update.effective_chat.id)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await remember_chat(update, context)
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "السلام عليكم ورحمة الله وبركاته\n\n"
+            "Welcome! I share Quran verses in Arabic with the Saheeh International "
+            "English translation.\n\n"
+            "Commands:\n"
+            "/verse — receive a random Quran verse\n"
+            "/daily — receive a verse now\n"
+            "/help — show this message\n\n"
+            "Daily verses are scheduled automatically for chats that have started "
+            "the bot."
+        )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await start(update, context)
+
+
+async def verse_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    verse = random.choice(VERSES)
+    if update.effective_message:
+        await update.effective_message.reply_text(format_verse(verse))
+
+
+async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await verse_command(update, context)
+
+
+async def send_daily_verse(context: ContextTypes.DEFAULT_TYPE) -> None:
+    subscribers: set[int] = context.application.bot_data.get("subscribers", set())
+    if not subscribers:
+        logger.info("No subscribed chats yet; skipping daily message.")
+        return
+
+    message = format_verse(random.choice(VERSES))
+    for chat_id in list(subscribers):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=message)
+        except Exception:
+            logger.exception("Could not send daily verse to chat %s", chat_id)
+
+
+async def post_init(application: Application) -> None:
+    subscribers_file = BASE_DIR / "subscribers.json"
+    try:
+        if subscribers_file.exists():
+            stored = json.loads(subscribers_file.read_text(encoding="utf-8"))
+            application.bot_data["subscribers"] = {int(chat_id) for chat_id in stored}
+        else:
+            application.bot_data["subscribers"] = set()
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        logger.exception("Could not load subscribers.json; starting with no saved chats.")
+        application.bot_data["subscribers"] = set()
+
+    try:
+        timezone = ZoneInfo(TIMEZONE_NAME)
+    except ZoneInfoNotFoundError as exc:
+        raise RuntimeError(
+            f"Unknown timezone '{TIMEZONE_NAME}'. Check the TIMEZONE setting."
+        ) from exc
+
+    if application.job_queue is None:
+        raise RuntimeError(
+            "JobQueue is unavailable. Set requirements.txt to "
+            "'python-telegram-bot[job-queue]==22.5'."
+        )
+
+    application.job_queue.run_daily(
+        send_daily_verse,
+        time=time(hour=DAILY_HOUR, minute=DAILY_MINUTE, tzinfo=timezone),
+        name="daily_quran_verse",
+    )
+    logger.info(
+        "Daily Quran verse scheduled for %02d:%02d (%s).",
+        DAILY_HOUR, DAILY_MINUTE, TIMEZONE_NAME
+    )
+
+
+async def post_shutdown(application: Application) -> None:
+    subscribers_file = BASE_DIR / "subscribers.json"
+    subscribers = sorted(application.bot_data.get("subscribers", set()))
+    try:
+        subscribers_file.write_text(
+            json.dumps(subscribers, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        logger.exception("Could not save subscribers.json.")
+
+
+def main() -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN is missing. Add your Telegram bot token in FadeHost "
+            "environment variables."
+        )
+    if not 0 <= DAILY_HOUR <= 23 or not 0 <= DAILY_MINUTE <= 59:
+        raise RuntimeError("DAILY_HOUR must be 0–23 and DAILY_MINUTE must be 0–59.")
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("verse", verse_command))
+    application.add_handler(CommandHandler("daily", daily_command))
+
+    logger.info("Bot is starting.")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
